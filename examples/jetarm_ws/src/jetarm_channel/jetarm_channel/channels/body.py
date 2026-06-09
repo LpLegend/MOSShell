@@ -9,6 +9,10 @@ body_chan = PyChannel(name="body")
 
 policy_pause_event = asyncio.Event()
 
+@body_chan.build.startup
+async def start_body():
+    await greeting()
+
 
 @body_chan.build.idle
 async def on_policy_run():
