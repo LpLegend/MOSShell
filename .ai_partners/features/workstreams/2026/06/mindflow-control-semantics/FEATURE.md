@@ -1,13 +1,14 @@
 ---
 created: 2026-06-02
 depends: []
-description: Impulse 增加 mode 分类 (think/reflex/command/notify/interrupt)， 扩展 challenge
-  仲裁支持 buffer 注入，abort 传播到 shell.clear， 支持空 attention 循环和确定性 CTML 指令。
+description: Impulse 增加 mode 分类, buffer/notify/silent 仲裁, interrupt=clear_first,
+  thinking_effort, 协议化强度/保护期. 删除 PriorityProtectionAttention/PriorityMindflow.
+  全 interpreter 用 append. memento 替换 conversation.
 milestone: null
 priority: P0
 status: in-progress
-title: Mindflow Control Semantics — Impulse 能力分类与非中断式抢占
-updated: '2026-06-10'
+title: Mindflow Control Semantics — 协议化仲裁与生命周期重构
+updated: '2026-06-11'
 ---
 
 # Mindflow Control Semantics
@@ -292,6 +293,45 @@ Impulse(priority=NOTICE, mode=think, clear_first=False)
 确认信息路径分层 (Signal→Impulse→Moment)、Action 暴露 interpreter_kind()、clear_first、
 notify 不创建 attention 等最终决策。staged 交付从 Stage 1 (Foundation) 开始。
 
+### 2026-06-11 大规模重构 review (Claude Opus 4.7 与人类工程师)
+
+**review 范围**: staged 17 files + unstaged 17 files，合计 ~1400 行改动。
+核心动作：删除 PriorityProtectionAttention / PriorityMindflow，将仲裁参数协议化到
+Impulse 字段；实现双层 buffer (Mindflow 级 + Attention 级)；memento 替换 conversation。
+
+**review 发现与修复**:
+
+| # | 级别 | 问题 | 处理 |
+|---|---|---|---|
+| 1 | 🔴P0 | `Moment.logos` 从未赋值 → `to_history_turns()` 不产回合 | 人类工程师修复：`_run_articulator` finally 中 `articulator.moment.logos = logos` |
+| 2 | 🔴P0 | `kind='clear'` → 应为 `'append'` | Claude 修复：`_stream_execute:408` 改为 `kind='append'` |
+| 3 | 🔴P0 | `BaseAction.wait_ready()` 无默认实现 | Claude 实现：消费 logos_queue 首包,缓存到 `_prefetched_delta`,`_logos()` 先 drain 缓存 |
+| 4 | 🟡P1 | `Impulse.prepare_timeout` 定义后未消费 | 确认需从 `ghost_runtime._run_articulator` 读取 |
+| 5 | 🟡P1 | `to_history_turns()` 的回合切分 bug | 确认修复：`last_moment_has_logos` 赋值移至 yield 后 |
+| 6 | 🟢P2 | `notify`/`buffer` 命名与语义相反 | 已改为 `notify`/`silent` |
+| 7 | 🟢P2 | `momento.py` 拼写错误 | 已改为 `memento.py` |
+| 8 | 🟢P2 | `ChallengeMode` 从 Literal 升级为 `str, Enum` | 支持扩展 |
+
+**待补单测** (下一个会话完成):
+
+1. `Action.wait_ready()` — 首包到达、abort 打断、空队列超时退出
+2. `Moment.logos` 赋值 — articulate 正常完成/exception/command 模式下 logos 字段状态
+3. `to_history_turns()` — command 模式的 executed_logos 缝合、正常回合切分、空 logos 合并到最后
+4. `shell.interpreter(kind='append')` — 跨帧命令延续、interrupt 后的 append 行为
+5. `moss_dynamic` 缓存 — `stale_time` 防反复生成
+6. `ChallengeMode.silent/notify` — silent 无 attention 只 buffer、notify 抢占成功/降级
+7. `Impulse.protection_time` — 保护期内同优先级压制
+8. `_challenge_attention` 6 条路径 — FATAL/BACKGROUND/silent/notify/absorbed/normal
+9. `GhostRuntimeImpl` 生命周期 — interrupt 协议、thinking_effort='none' 不调 articulate
+
+**设计确认** (下一个会话交叉验证):
+
+- 双层 buffer 分工：Mindflow 级 `_buffered_messages`(跨 attention) vs Attention 级 `_buffered_impulses`(帧内 Drain)
+- `interrupt=True` = `stop_interpretation()` + `kind='append'`：解释器永远 append,打断由主循环管
+- reflex 走 Articulator 通道：`command_logos` 由 `_run_articulator.send_nowait()` 发送,先于模型 CTML
+- `thinking_effort='none'` 时 `_run_articulator` 提前返回：不调 `ghost.articulate()`,不调 `on_articulate_exit()`,command CTML 走 `executed_logos`
+- memento 体系 (MomentBranch/MomentoIndex 等) 开发冻结,但 `Moment.to_history_turns()` 已就位
+
 ---
 
-*调研与评审: DeepSeek V4 与人类工程师, 2026-06-02 ~ 2026-06-10*
+*调研与评审: DeepSeek V4 / Claude Opus 4.7 与人类工程师, 2026-06-02 ~ 2026-06-11*

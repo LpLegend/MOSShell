@@ -62,6 +62,7 @@ class ChannelRuntimeNode:
             loop: asyncio.AbstractEventLoop,
             logger: LoggerItf,
             refresh_interval: float = 0.0,
+            max_refresh_time: float = 2.0,
     ):
         self.id = id
         self.path = path
@@ -72,7 +73,7 @@ class ChannelRuntimeNode:
         self.refreshing_task: Optional[asyncio.Task] = None
         self.refresh_interval: float = refresh_interval
         self.failure: str = ''
-
+        self.max_refresh_time: float = max_refresh_time
         self.sustain_children: set[_ChannelId] = set()
         self.virtual_children: set[_ChannelId] = set()
         self.children_names: dict[_ChannelId, _ChannelName] = dict()
@@ -99,13 +100,29 @@ class ChannelRuntimeNode:
         if not runtime.is_running():
             # 容错. 应该不会被调用到.
             self.logger.error("%r refresh after running done", self)
-            return asyncio.create_task(_noop())
+            return self.loop.create_task(_noop())
         if self.refreshing_task is not None and not self.refreshing_task.done():
             # 返回未完成的 task.
             return self.refreshing_task
         # 创建新的 task.
-        self.refreshing_task = asyncio.create_task(self._refresh(runtime, ctx, wait))
+        tick_overdue = self.loop.create_task(self._tick_max_refresh_time(time.monotonic()))
+
+        def _cancel_tick(t):
+            if not tick_overdue.done():
+                tick_overdue.cancel()
+
+        self.refreshing_task = self.loop.create_task(self._refresh(runtime, ctx, wait))
+        self.refreshing_task.add_done_callback(_cancel_tick)
         return asyncio.shield(self.refreshing_task)
+
+    async def _tick_max_refresh_time(self, now: float):
+        try:
+            await asyncio.sleep(self.max_refresh_time)
+            if now > self.refreshed_at:
+                # 不会 cancel, 而是阶段性的中断 channel 的展示.
+                self.failure = 'refresh meta overdue'
+        except asyncio.CancelledError:
+            pass
 
     def get_own_metas(self, runtime: ChannelRuntime) -> tuple[dict[ChannelFullPath, ChannelMeta], bool]:
         """
@@ -132,7 +149,7 @@ class ChannelRuntimeNode:
             ctx: ChannelTreeContext,
             recursive_wait: bool,
     ) -> None:
-        now = time.time()
+        now = time.monotonic()
         async with self.refreshing_lock:
             # 检查不合法.
             if now < self.refreshed_at + self.refresh_interval:
@@ -151,10 +168,8 @@ class ChannelRuntimeNode:
                     task = ctx.refresh(channel_id, wait=recursive_wait)
                     if task and recursive_wait:
                         waiting_tasks.append(task)
-                wait_self = runtime.refresh_own_metas()
+                await asyncio.wait_for(runtime.refresh_own_metas(), timeout=self.max_refresh_time)
                 # 先阻塞等待自己.
-
-                await wait_self
                 if recursive_wait and len(waiting_tasks) > 0:
                     # 然后等待子孙.
                     _ = await asyncio.gather(*waiting_tasks, return_exceptions=True)
@@ -164,13 +179,16 @@ class ChannelRuntimeNode:
             except asyncio.CancelledError:
                 self.logger.info("%r refreshed cancelled", self)
                 raise
+            except asyncio.TimeoutError:
+                self.logger.info("%r refresh timeout", self)
+                self.failure = 'refresh timeout'
             except Exception as e:
                 self.logger.error("%r refreshed exception: %r", self, e, exc_info=True)
 
                 # 更新失败, 不允许使用.
                 self.failure = "refresh failed: %s" % e
             finally:
-                self.refreshed_at = time.time()
+                self.refreshed_at = time.monotonic()
                 self.logger.info("%r refreshed done", self)
 
     async def _refresh_structure(

@@ -116,6 +116,7 @@ NucleusMeta 是生产感知核（Nucleus）的工厂。放在 `MOSS/manifests/nu
 from ghoshell_moss.core.blueprint.mindflow import NucleusMeta, Nucleus, InputSignal
 from ghoshell_container import IoCContainer
 
+
 class MyNucleusMeta(NucleusMeta):
     def name(self) -> str:
         return "my_nucleus"
@@ -128,6 +129,7 @@ class MyNucleusMeta(NucleusMeta):
 
     def factory(self, container: IoCContainer) -> Nucleus:
         return MyNucleus(...)
+
 
 my_nucleus_factory = MyNucleusMeta()
 ```

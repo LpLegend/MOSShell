@@ -1,4 +1,4 @@
-from typing import AsyncIterable, AsyncIterator, AsyncGenerator
+from typing import AsyncIterator, AsyncGenerator
 import asyncio
 import threading
 import time
@@ -711,3 +711,29 @@ async def test_with_statement():
         # 没被拦截
         a.append(1)
     # assert len(a) == 2
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout():
+    async def foo():
+        await asyncio.sleep(0.1)
+
+    task1 = asyncio.create_task(foo())
+    task2 = asyncio.create_task(foo())
+    task3 = asyncio.create_task(foo())
+    done, pending = await asyncio.wait([task1, task2, task3], timeout=0.01)
+    assert len(pending) == 3
+    assert len(done) == 0
+    for t in pending:
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
+
+@pytest.mark.asyncio
+async def test_wait_for_none():
+    async def foo():
+        await asyncio.sleep(0.05)
+
+    r = await asyncio.wait_for(foo(), timeout=None)
+    assert r is None
