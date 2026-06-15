@@ -66,7 +66,7 @@ for i, _l in enumerate(LAYOUTS):
 # moss_listener 同步写，context_messages() 只读
 @dataclass
 class _LayoutMirror:
-    name: str = "simple"
+    name: str = "stage"
 
     def get_component(self) -> rx.Component:
         for n, c in LAYOUT_COMPONENTS:
@@ -89,7 +89,7 @@ _SNAPSHOTS: dict[str, LayoutSnapshot] = {
 class State(rx.State):
     """The app state."""
 
-    layout: str = "simple"
+    layout: str = "stage"
 
     @rx.event(background=True)
     async def moss_listener(self):
@@ -199,6 +199,8 @@ def index() -> rx.Component:
             *LAYOUT_COMPONENTS,
             rx.text("default")
         ),
+        max_width="100%",
+        padding="0",
     )
 # =========================== Reflex ===========================
 
@@ -239,8 +241,20 @@ async def context_messages():
     return messages
 
 
+def _frontend_url():
+    host, port = "localhost", 3000
+    try:
+        from reflex.config import get_config
+        cfg = get_config()
+        port = cfg.frontend_port or port
+    except Exception:
+        pass
+    return f"当前前端页面地址为 http://{host}:{port}"
+
+
 async def moss():
     chan = PyChannel(name="reflex", description="提供基于Reflex框架的流式GUI页面，用于AI实时渲染")
+    chan.build.instruction(_frontend_url)
     chan.build.context_messages(context_messages)
 
     first = True

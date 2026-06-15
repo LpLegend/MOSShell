@@ -19,17 +19,16 @@ __all__ = [
 
 
 class AudioNucleus(BufferNucleus):
-    """Audio signal nucleus with SPEECH_STARTED preemption.
+    """Audio signal nucleus — aggregate ASR signals into attention impulses.
 
-    SPEECH_STARTED (incomplete, ASR first packet) flows through the buffer
-    and produces an incomplete Impulse that preempts the current Attention.
-    The Impulse carries interrupt=True, causing GhostRuntime to stop the
-    shell's current interpretation before entering the new Attention.
+    SPEECH_STARTED (incomplete) signals are buffered but do NOT interrupt
+    the current attention — they accumulate until a SPEECH_FINAL arrives.
+    SPEECH_FINAL purges incomplete predecessors, produces a complete Impulse
+    with interrupt=True, and triggers the articulate→action loop.
 
-    SPEECH_FINAL (complete, ASR final result) shares the same signal ID as
-    the preceding SPEECH_STARTED.  Before buffering FINAL, all incomplete
-    signals are purged — the rebuilt Impulse becomes complete, the Attention
-    absorbs it (same ID), and the articulate→action loop begins.
+    Only complete (SPEECH_FINAL) impulses carry interrupt=True.  Incomplete
+    impulses (SPEECH_STARTED only, without a matching FINAL) do not interrupt
+    — they are buffered silently and expire via the pulse beat mechanism.
     """
 
     async def _process_signal(self, signal: Signal) -> None:
@@ -42,7 +41,7 @@ class AudioNucleus(BufferNucleus):
 
     def _rebuild_impulse(self) -> Impulse | None:
         impulse = super()._rebuild_impulse()
-        if impulse is not None:
+        if impulse is not None and impulse.complete:
             impulse.interrupt = True
         return impulse
 

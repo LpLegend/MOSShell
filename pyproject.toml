@@ -28,7 +28,7 @@ zmq = ["zmq>=0.0.0", "aiozmq>=1.0.0", "psutil>=7.2.1"]
 redis = ["fakeredis>=2.32.1", "redis>=7.0.1"]
 
 ghost = [
-    "pydantic-ai>=1.90.0",
+    "pydantic-ai>=1.107.0",
     "anthropic>=0.84.0",
 ]
 
