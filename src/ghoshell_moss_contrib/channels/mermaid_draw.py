@@ -1,20 +1,64 @@
-import urllib.parse
+import base64
+import re
 import webbrowser
 
 from ghoshell_moss.core import PyChannel
 
 __all__ = ["new_mermaid_chan"]
 
-"""
-实现一个 Mermaid Channel, 让 AI 在对话上下文中可以随时通过浏览器绘制 mermaid 图形来表达思路. 
-
-预计在 Beta 版本中实现的功能: 
-
-1. 指定一个目录, 用 markdown 文件的方式存储 mermaid. 
-2. 允许 AI 在绘制一个 Mermaid 同时存储它, 方便未来读取. 
-3. Channel 上下文列出已经存储的 Mermaid id 和简介, 方便模型直接调用已经绘制过的图. 
-4. AI 可以通过 command, 读取一个 mermaid id, 并且修改它.  
-"""
+_MERMAID_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({{
+    startOnLoad: true,
+    theme: 'default'
+  }});
+</script>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html, body {{
+    width: 100%; height: 100%;
+    background: #fff;
+  }}
+  body {{
+    display: flex; flex-direction: column;
+  }}
+  h1 {{
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 1.5rem; padding: 1rem;
+    text-align: center;
+    flex-shrink: 0;
+  }}
+  .wrapper {{
+    flex: 1;
+    display: flex; justify-content: center; align-items: center;
+    min-height: 0;
+  }}
+  .mermaid {{
+    height: 100%;
+    display: flex; justify-content: center; align-items: center;
+  }}
+  .mermaid svg {{
+    height: 100% !important;
+    width: auto !important;
+    max-width: none !important;
+  }}
+</style>
+</head>
+<body>
+  <h1>{title}</h1>
+  <div class="wrapper">
+    <pre class="mermaid">
+{code}
+    </pre>
+  </div>
+</body>
+</html>"""
 
 
 def new_mermaid_chan() -> PyChannel:
@@ -30,8 +74,7 @@ def new_mermaid_chan() -> PyChannel:
 
 
 async def draw_mermaid(title: str = "MOSShell Diagram", text__: str = "") -> str:
-    """
-    在浏览器中绘制 Mermaid 图表
+    """在浏览器中绘制 Mermaid 图表
 
     Args:
         title: 图表标题
@@ -42,38 +85,13 @@ async def draw_mermaid(title: str = "MOSShell Diagram", text__: str = "") -> str
     Returns:
         状态消息
     """
+    code = text__.strip()
+    code = re.sub(r"^```(?:mermaid)?\s*\n?", "", code)
+    code = re.sub(r"\n?```\s*$", "", code)
+    code = code.replace("\\n", "<br/>")
 
-    # 创建在线编辑器 URL
-    url = _create_editor_url(text__, title)
-
-    # 打开浏览器
+    html = _MERMAID_HTML.replace("{title}", title).replace("{code}", code)
+    b64 = base64.b64encode(html.encode("utf-8")).decode("ascii")
+    url = f"data:text/html;charset=utf-8;base64,{b64}"
     webbrowser.open(url)
-
     return f"已在浏览器中打开 Mermaid 图表: {title}"
-
-
-def _create_editor_url(code: str, title: str) -> str:
-    """创建在线编辑器 URL"""
-    # 使用 mermaid.live 编辑器
-    base_url = "https://mermaid.live/edit"
-
-    # 构建完整的 HTML 页面
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>{title}</title>
-        <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-        <script>mermaid.initialize({{startOnLoad:true}});</script>
-    </head>
-    <body>
-        <div class="mermaid">
-            {code}
-        </div>
-    </body>
-    </html>
-    """
-
-    # 转换为 data URL
-    encoded = urllib.parse.quote(html)
-    return f"data:text/html;charset=utf-8,{encoded}"

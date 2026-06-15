@@ -1,13 +1,19 @@
 ---
-title: Module Eval Channel
-status: in-progress
-priority: P2
 created: 2026-06-03
-updated: 2026-06-07
-depends: [codex-module-sandbox]
-milestone:
-description: >-
-  Generic channel type that wraps any Python module as an eval container — AI sees module source as instruction, writes code via named exec command with text__ parameter, persistent namespace across calls, module defines the domain (Playwright, pandas, ROS…), channel is a thin reusable shell.
+depends:
+- codex-module-sandbox
+description: Generic channel type that wraps any Python module as an eval container
+  — AI sees module source as instruction, writes code via named exec command with
+  text__ parameter, persistent namespace across calls, module defines the domain (Playwright,
+  pandas, ROS…), channel is a thin reusable shell.
+milestone: null
+priority: P1
+status: completed
+status_note: 2026-06-10 ModuleEval 正式化完成。通用 subprocess 协议 (tools/_eval_server.py)，
+  ModuleEval + JsonLineProcess (tools/module_eval.py)，Channel 完全重写。 14 tests pass。Playwright
+  迁移验证。interface 提取、storage+define command 后续迭代。
+title: Module Eval Channel
+updated: '2026-06-10'
 ---
 
 # Module Eval Channel
@@ -113,9 +119,11 @@ Playwright sync API 需要在主线程/固定单线程运行。Matrix Channel Ru
 
 ### 6. 先做 channel type，后做 Playwright App
 
-第一阶段产出是 `ModuleEvalChannel` 本身 + 单测。它是一个可复用的 channel type，位于 `ghoshell_moss.channels`。第二阶段才用它在 `.moss_ws/apps/` 下创建具体的 Playwright App。
+第一阶段产出是 `ModuleEvalChannel` 本身 + 单测。第二阶段用它在 `.moss_ws/apps/` 下创建 Playwright App。
 
-**Why**: 单测先于 App——channel type 的正确性不依赖浏览器。Playwright 是验证泛用性的第一个用例，但不是 channel type 存在的理由。
+Playwright 是核心验收用例——跨调用浏览器进程存活、Janus 桥线程模型、storageState 恢复，验证的是 sandbox 作为持久化 REPL 的价值。Pandas/SQLite 等无状态场景不比 `python -c` 强太多，不做独立验收。
+
+**Why**: 单测验证 channel type 正确性，Playwright 验证泛用性。浏览器是有状态长时间运行对象的代表——这个 case 通了，其他领域对象（pygame、ROS node、OpenCV pipeline）同理。
 
 ## Design Index
 
@@ -127,11 +135,134 @@ Playwright sync API 需要在主线程/固定单线程运行。Matrix Channel Ru
 
 ## Implementation Notes
 
-- **依赖 Sandbox**：`exec` 命令内部委托给 `Sandbox.exec()`，不自己拼接 `exec()` / 管理 `ModuleType` / 重定向 stdout
-- Module 领域对象通过 `Sandbox(parent=...)` 或 `sandbox.set()` 注入——Sandbox 的父子共享机制天然适合 Module 预装对象
-- `exec` 命令签名：`async def exec_code(text__: str, observe: bool = False) -> str`。`always_observe=True` 确保模型在每个 `exec` 后看到 stdout 输出
-- Sandbox 已处理 `print()` 捕获（`ExecutionResult.std_output`）——Channel 层只需格式化结果
-- `text__` 是完整字符串——CTML 解析器在闭合 `</playwright:exec>` 时交付完整文本
-- namespace 清理时用 `type(v).__module__` 检测 Playwright 对象引用，而非 `isinstance` 检查（避免导入 Playwright 作为硬依赖）
-- `api()` 用 `inspect.signature` + `inspect.getdoc`，不需要导入目标模块以外的依赖
+- **依赖 Sandbox**：`exec` 内部委托给 `Sandbox.exec()`，处理 `ExecutionResult`（std_output, exception, traceback, returns）
+- **反射委托 Reflector**：Sandbox init 时持有 `Reflector(module, source=module_source)`，`get_interface()` 返回 source + import attr 块，与 `moss codex get-interface` 一致
+- `vars()` 委托给 `sandbox.get_interface()`——返回 Reflector 输出（module source + `<attr>` 块）
+- `api(name)` 委托给 `sandbox.get_interface(name)`——import 对象走 `reflect_imported_attr` 管线，本地对象走 inspect fallback
+- `api(name, *methods)` 保留 channel 层 logic——`inspect.signature` + `inspect.getdoc` 对 exec 对象始终可用
+- **生命周期修复**：cleanup 关闭 `init_sandbox`（root），级联关闭 child sandbox 后清理 namespace
+- `exec` 命令签名：`async def exec_code(text__: str) -> str`，`always_observe=True`
 - Sandbox 的 builtins 安全策略由 Sandbox 的 FEATURE.md 定义——Channel 层不重复决策
+
+## 2026-06-09: Playwright App 验证与架构定型
+
+Playwright App (`browsers/playwright`) 作为第一个实际验收用例，完成了全链路验证。
+
+### 探索路径
+
+| 方案 | 问题 | 结论 |
+|------|------|------|
+| Sandbox.exec() 在 async handler 内 | Playwright Sync API 检测到 asyncio event loop，拒绝初始化 | 不可行 |
+| pexpect `python -i` REPL | 多行 echo 与 prompt 匹配歧义，输出不可靠 | 不可靠 |
+| Janus 桥（queue.Queue + threading.Event） | 仍未解决 asyncio 冲突，且增加复杂度 | 过度设计 |
+
+### 最终方案：子进程 Sandbox Eval Server
+
+```
+Parent (Channel, async)              Child (eval_server.py, sync)
+───────────────────────              ─────────────────────────────
+EvalServer.__init__()                import playwright
+  Popen -> wait "ready"                init Sandbox
+                                       inject page/browser/context
+exec: server.send(code)              eval loop:
+  stdin -> JSON request                stdin.readline -> JSON parse
+  stdout <- JSON result                sandbox.exec(code)
+                                       stdout.write -> JSON result
+```
+
+**协议**: JSON-line，一行请求一行响应。`{"code": "..."}` -> `{"returns": ..., "std_output": ..., "exception": ..., "traceback": ...}`
+
+**核心洞察**:
+- Playwright 等有状态领域对象的控制，不需要预定义 Command 封装
+- 模型凭预训练知识写原生 Python API 调用——比任何 wrapper 都精准
+- Sandbox 提供 builtins 安全 + 持久化 namespace
+- 子进程隔离自然解决了 asyncio 冲突
+- 此方案本质上是 2024 年 MOSS 论文 (arXiv:2409.16120) 核心洞察的再发现——持久化 REPL + Code as Prompt + IoC 抽象，增加了子进程安全边界
+
+### Playwright App 实现
+
+- `eval_server.py`: ~60 行，子进程入口。启动 Playwright → 建 Sandbox → JSON-line eval loop
+- `main.py`: ~90 行，父进程 Channel。EvalServer + exec/vars 命令
+- 模块级 EvalServer.__init__：在 Matrix event loop 启动前完成 spawn，规避 asyncio 问题
+- 预注入 `json`/`urllib` 到 sandbox namespace，供 AI 代码使用
+
+### 泛化路径
+
+同一 `eval_server.py` 模式可包裹任意 Python 模块：
+- pandas → DataFrame REPL
+- ROS2 → 机器人节点控制
+- OpenCV → 视觉 pipeline
+- SQLite → 数据库 REPL
+
+核心抽象：Module Source = instruction (Code as Prompt)，Sandbox exec = 持久化 REPL，JSON-line = 无歧义协议。
+
+### 关联 artifacts
+
+- App 目录: `.moss_ws/apps/browsers/playwright/`
+- 架构文档: `.design/2026-06-09_subprocess_sandbox_eval_protocol.md`
+- 原始论文: arXiv:2409.16120 (MOSS: Enabling Code-Driven Evolution and Context Management for AI Agents)
+
+## 2026-06-10: ModuleEval 正式化 — 通用 subprocess 协议
+
+> 人类架构师 + deepseek-v4-pro。从 Playwright 特例提取通用抽象。
+
+### 三层架构
+
+```
+ModuleEvalChannel (channels)    ← CTML 接口: exec/vars/api
+  ModuleEval (tools)            ← bootstrap: 读源码、spawn、JSON-line
+    _eval_server.py (tools)     ← 通用子进程: Compile → Sandbox → loop
+```
+
+**`ModuleEval`** 是核心抽象 (`ghoshell_moss.tools.module_eval`):
+- `__init__(module_path, *, matrix=None)` — 读 .py 文件源码，不 import
+- `start()` — spawn 子进程，matrix 有则 `matrix.spawn()`，无则裸 asyncio
+- `exec(code)`, `vars()`, `api(name)` — 协议命令
+- `instruction` — 源码即 prompt
+
+**`_eval_server.py`** 是通用子进程入口:
+- 接受 `MODULE_FILE` 环境变量
+- Compiler 编译模块 (builtins unrestricted, 执行 import)
+- init_sandbox (builtins=None) 持有编译后命名空间
+- sandbox (parent=init, SANDBOX_BUILTINS) 为 AI exec 命名空间
+- 协议命令: `__SHUTDOWN__`, `__vars__`, `__api__`
+- 清理: 对命名空间对象调用 `close()`/`stop()`
+
+### 显式安全授权
+
+模块源码即授权边界。`import json` 写在文件里 → namespace 里有 json。
+没写 → AI 无法用。不需要运行时 `set()` 注入，不需要白名单配置。
+
+### 关键决策
+
+1. **`.py` 文件路径，不是 import path** — 父进程零运行时依赖
+2. **Source-only prompt** — interface 提取本阶段丢弃，未来通过 treeparser 实现
+3. **`__name__` 约束** — Compiler 的 `modulename` 决定 `__name__`，不是 `__main__`
+4. **相对 import 不做 AST scan** — 编译时自然报错，不做前置检测
+5. **`matrix: Matrix | None`** — 双 spawn 路径，测试和独立使用友好
+6. **`ghoshell_moss.tools`** — 新包，不走 IoC，纯功能件
+
+### Playwright 迁移
+
+- `eval_server.py` 删除，由通用 `_eval_server.py` 替代
+- 提取 `playwright_domain.py` — ~10 行纯领域代码
+- `main.py` 使用 `new_module_eval_channel(domain_path, matrix=matrix)`
+- EvalServer 类删除，JsonLineProcess 接管
+
+### 测试
+
+14 个单测全部通过。验证: exec 执行、变量持久化、vars/api 反射、
+builtins 安全（open/import 被封锁）、异常返回 traceback、命名空间在错误后保留。
+
+### 未展开的扩展点
+
+- interface 提取 (AST/treeparser)
+- storage + define command 动态技能体系
+- on_shutdown 显式清理协议 (当前用 close/stop 自动发现)
+
+### 关联 artifacts
+
+- `src/ghoshell_moss/tools/` — ModuleEval + JsonLineProcess + _eval_server
+- `src/ghoshell_moss/channels/module_eval_channel.py` — 完全重写
+- `.moss_ws/apps/browsers/playwright/` — 迁移验证
+- `tests/ghoshell_moss/channels/test_module_eval_channel.py` — 14 tests

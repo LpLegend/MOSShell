@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from ghoshell_moss.core.concepts.channel import Channel, ChannelProxy
 from ghoshell_moss.core.blueprint.session import Session
 from ghoshell_moss.contracts import LoggerItf, ConfigStore, Workspace, SystemPrompter, ResourceRegistry, Storage
+from ghoshell_moss.contracts.configs import CONF_TYPE
 from ghoshell_container import IoCContainer
 from ghoshell_moss.core.blueprint.manifests import Manifests
 from pydantic import BaseModel, Field
@@ -463,6 +464,24 @@ class Matrix(ABC):
             }
             yield info
 
+    def query_config(self, config_type: Type[CONF_TYPE]) -> CONF_TYPE:
+        """按类型查询配置。Matrix 级别的统一配置访问入口。
+
+        等价于 self.configs.get(config_type)，但作为 Matrix 方法暴露，
+        便于跨进程发现时明确"从 Matrix 查询配置"这一语义。
+        """
+        return self.configs.get(config_type)
+
+    def on_config_change(self, config_name: str, callback: Callable[[], None]) -> Callable[[], None]:
+        """订阅配置变更通知。返回取消订阅句柄。
+
+        config_name 对应 ConfigType.conf_name() 的返回值。
+        跨进程共享同一 workspace 时，配置变更通过 Matrix 的通信层传播。
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement on_config_change()"
+        )
+
     # --- scopes. 运行时的作用域信息. --- #
 
     @property
@@ -640,6 +659,44 @@ class Matrix(ABC):
     ) -> asyncio.Task:
         """
         创建包含在 Matrix 生命周期内的 Task
+        """
+        pass
+
+    # --- 子进程 spawn --- #
+
+    @abstractmethod
+    async def spawn(
+            self,
+            *args: str,
+            cell_address: str | None = None,
+            cwd: str | Path | None = None,
+            extra_env: dict | None = None,
+            nursery_fd: int | None = None,
+            stdin: int | None = None,
+            stdout: int | None = None,
+            stderr: int | None = None,
+    ) -> asyncio.subprocess.Process:
+        """
+        Spawn a subprocess with MOSS environment context.
+
+        The child inherits Matrix session identity (workspace, scope,
+        session_id, parent_pid) via environment variables.  If *cell_address*
+        is given, MOSS_CELL_ADDRESS is set so the child can join the Matrix
+        as a cell.
+
+        Pipe fencing: pass a pipe read-fd as *nursery_fd* to enable
+        zero-latency parent-death detection.  The parent holds the write
+        end; when the parent dies (including SIGKILL), the kernel closes
+        all fds, the child's read returns EOF, and the child can exit
+        gracefully.  Create the pipe with ``os.pipe()``, pass the read-fd,
+        and close the read end in the parent after spawn.
+
+        The child runs in its own process group (``start_new_session=True``)
+        so terminal signals to the parent do not propagate.
+
+        *stdin*, *stdout*, *stderr* — pass ``asyncio.subprocess.PIPE``
+        for async stream I/O, ``asyncio.subprocess.DEVNULL`` to suppress,
+        or an fd for file redirection.  None inherits from parent.
         """
         pass
 

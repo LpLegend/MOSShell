@@ -3,13 +3,12 @@ import inspect
 import logging
 from typing import Optional, Callable, Iterable
 
-from ghoshell_container import BINDING, INSTANCE, IoCContainer, Provider, provide, Container
+from ghoshell_container import BINDING, INSTANCE, IoCContainer, Provider, provide
 from typing_extensions import Self
 
 from ghoshell_moss.message import Message
 from ghoshell_moss.core.concepts.channel import (
     Channel,
-    ChannelRuntime,
     ChannelMeta,
     ChannelNamePattern,
     ChannelName,
@@ -34,7 +33,7 @@ from ghoshell_moss.core.blueprint.channel_builder import (
     ChannelFactory,
 )
 from ghoshell_moss.core.blueprint.states_channel import ChannelModule
-from copy import copy
+import time
 import re
 
 __all__ = ["PyChannel", "StatefulChannelRuntimeImpl", "PyChannelBuilder", "BaseStateChannel"]
@@ -169,6 +168,8 @@ class PyChannelBuilder(MutableChannelState, ChannelState):
     async def get_instruction(self) -> str:
         if self._instruction_functions is None:
             return ''
+        if isinstance(self._instruction_functions, str):
+            return self._instruction_functions
         if inspect.iscoroutinefunction(self._instruction_functions):
             return await self._instruction_functions()
         return self._instruction_functions()
@@ -204,6 +205,7 @@ class PyChannelBuilder(MutableChannelState, ChannelState):
             return_command: bool = False,
             always_observe: bool = False,
             timeout: Optional[float] = None,
+            visible: bool = True,
     ) -> Callable[[CommandFunction], CommandFunction | Command]:
 
         def wrapper(func: CommandFunction) -> CommandFunction:
@@ -221,6 +223,7 @@ class PyChannelBuilder(MutableChannelState, ChannelState):
                 call_soon=call_soon,
                 always_observe=always_observe,
                 timeout=timeout,
+                visible=visible,
             )
             self.add_command(command, override=override)
             if return_command:
@@ -326,6 +329,7 @@ class PyChannelBuilder(MutableChannelState, ChannelState):
     def refresh_meta(self, func: LifecycleFunction) -> LifecycleFunction:
         is_coroutine = inspect.iscoroutinefunction(func)
         self._on_refresh_meta_funcs.append((func, is_coroutine))
+        self._dynamic = True
         return func
 
     async def on_refresh_meta(self) -> None:
@@ -686,6 +690,8 @@ class StatefulChannelRuntimeImpl(StatefulChannelRuntime, AbsChannelTreeRuntime[S
             meta.commands = command_metas
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            raise
         except Exception as e:
             meta = ChannelMeta(
                 name=name,
@@ -845,21 +851,16 @@ class StatefulChannelRuntimeImpl(StatefulChannelRuntime, AbsChannelTreeRuntime[S
 
     async def on_refresh_meta(self) -> None:
         """通知 main state, modules, current state: 即将重新生成 metas。"""
-        try:
-            refresh_funcs = [self._main_state.on_refresh_meta()]
-            if self._current_state is not None:
-                refresh_funcs.append(self._current_state.on_refresh_meta())
-            for module in self._modules.values():
-                if hasattr(module, 'on_refresh_meta'):
-                    refresh_funcs.append(module.on_refresh_meta())
-            done = await asyncio.gather(*refresh_funcs, return_exceptions=True)
-            for r in done:
-                if isinstance(r, Exception):
-                    self.logger.error("%r on_refresh_meta func failed: %s", self, r)
-        except asyncio.CancelledError:
-            self.logger.info(f"%r on_refresh_meta cancelled", self)
-        except Exception as e:
-            self.logger.exception("%r on_refresh_meta failed: %s", self, e)
+        refresh_funcs = [self._main_state.on_refresh_meta()]
+        if self._current_state is not None:
+            refresh_funcs.append(self._current_state.on_refresh_meta())
+        for module in self._modules.values():
+            if hasattr(module, 'on_refresh_meta'):
+                refresh_funcs.append(module.on_refresh_meta())
+        done = await asyncio.gather(*refresh_funcs, return_exceptions=True)
+        for r in done:
+            if isinstance(r, Exception):
+                self.logger.error("%r on_refresh_meta func failed: %s", self, r)
 
     def __repr__(self):
         return self.log_prefix

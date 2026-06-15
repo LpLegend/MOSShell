@@ -1,0 +1,1 @@
+Ghost `MossIntro` 的持久化存储空间. 

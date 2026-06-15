@@ -1,3 +1,4 @@
+import asyncio
 from typing import AsyncIterator, TYPE_CHECKING
 from typing_extensions import Self
 from ghoshell_moss.core.blueprint.ghost import Ghost, GhostMeta
@@ -80,14 +81,43 @@ class Atom(Ghost):
         request = self.to_model_request(moment)
         history = self.model_history()
 
-        async with self._agent.run_stream(
-            user_prompt=request.parts,
-            message_history=history,
-            deps=self._container,
-        ) as stream:
-            async for text in stream.stream_text(delta=True):
-                yield text
-            self.save_model_request(moment, stream.response)
+        # 用 queue 解耦 pydantic_ai stream 和 async generator 协议，
+        # 避免 attention fade out 时 Python 的 aclose() 撞上 pydantic_ai
+        # 内部仍在运行的嵌套 async generator（group_by_temporal 等）。
+        queue: asyncio.Queue[tuple[bool, str | BaseException]] = asyncio.Queue()
+
+        async def _stream_to_queue():
+            try:
+                async with self._agent.run_stream(
+                    user_prompt=request.parts,
+                    message_history=history,
+                    deps=self._container,
+                ) as stream:
+                    async for text in stream.stream_text(delta=True):
+                        await queue.put((False, text))
+                    self.save_model_request(moment, stream.response)
+                    await queue.put((True, ""))
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:
+                await queue.put((False, e))
+
+        task = asyncio.create_task(_stream_to_queue())
+        try:
+            while True:
+                done, value = await queue.get()
+                if done:
+                    return
+                if isinstance(value, BaseException):
+                    raise value
+                yield value
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
 
     # ── 生命周期 ──────────────────────────────────
 

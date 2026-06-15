@@ -1,6 +1,7 @@
 import asyncio
 import os
-from typing import Coroutine, Iterable, Type, Literal
+from pathlib import Path
+from typing import Coroutine, Iterable, Type, Literal, Callable
 
 from typing_extensions import Self
 
@@ -28,6 +29,7 @@ from ghoshell_moss.host.providers import (
 )
 from ghoshell_moss.bridges.zenoh_bridge import ZenohChannelProvider, ZenohProxyChannel
 from ghoshell_moss.core.helpers import ThreadSafeEvent
+from ghoshell_moss.host.nursery import ProcessNursery, watch_nursery_pipe, StdioTarget
 from ghoshell_moss.message import unique_id
 from ghoshell_moss.depends import depend_zenoh
 from ghoshell_moss.host.cell_discovery import CellDiscovery
@@ -39,7 +41,7 @@ import contextlib
 import logging
 import threading
 import time
-import psutil
+
 
 __all__ = ['AppCell', 'HostCell', 'NetworkCell', 'MatrixImpl']
 
@@ -156,6 +158,7 @@ class MatrixImpl(Matrix):
         self._live_cells_lock = threading.Lock()
         self._logger: LoggerItf | logging.Logger | None = logger
         self._started = False
+        self._config_change_callbacks: dict[str, list[Callable[[], None]]] = {}
         self._channel_provider_task: asyncio.Task | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._closing_event = ThreadSafeEvent()
@@ -174,6 +177,9 @@ class MatrixImpl(Matrix):
         self._system_prompter = self._prepare_system_prompter()
         self._container = self._prepare_container()
         self._lifecycle_bound_objects_or_types: list[MatrixLifecycleObject | Type[MatrixLifecycleObject]] = []
+        self._nursery = ProcessNursery(
+            logger=getattr(self._logger, 'info', None) and self._logger,
+        )
 
         if isinstance(self._this_cell, UnknownCell):
             log = self._logger or self.env.logger
@@ -339,7 +345,8 @@ class MatrixImpl(Matrix):
         # 注册 configs — 仅类型注册（is_override=False），文件持久化
         # 实例覆盖（is_override=True）在 lifecycle 中通过 set_config 内存写入
         default_providers.append(WorkspaceYamlConfigStoreProvider(
-            *[info.config for info in self.manifests.configs().values() if not info.is_override]
+            *[info.config for info in self.manifests.configs().values() if not info.is_override],
+            on_save=self._on_config_saved,
         ))
         # 注册 session.
         default_providers.append(HostSessionProvider())
@@ -474,6 +481,32 @@ class MatrixImpl(Matrix):
     def configs(self) -> ConfigStore:
         return self.container.force_fetch(ConfigStore)
 
+    def on_config_change(self, config_name: str, callback: Callable[[], None]) -> Callable[[], None]:
+        if config_name not in self._config_change_callbacks:
+            self._config_change_callbacks[config_name] = []
+        self._config_change_callbacks[config_name].append(callback)
+
+        def unsubscribe():
+            cbs = self._config_change_callbacks.get(config_name, [])
+            try:
+                cbs.remove(callback)
+            except ValueError:
+                pass
+
+        return unsubscribe
+
+    def _on_config_saved(self, config_name: str) -> None:
+        """ConfigStore 变更时触发本地回调。
+
+        跨进程一致性由共享 workspace/configs/ 文件系统保证——
+        其他进程重新 get 即读到最新值。
+        """
+        for cb in self._config_change_callbacks.get(config_name, []):
+            try:
+                cb()
+            except Exception:
+                pass
+
     @property
     def workspace(self) -> Workspace:
         return self._workspace
@@ -529,6 +562,31 @@ class MatrixImpl(Matrix):
         task = self._event_loop.create_task(_wait_done())
         self._add_task(task)
         return task
+
+    async def spawn(
+            self,
+            *args: str,
+            cell_address: str | None = None,
+            cwd: str | Path | None = None,
+            extra_env: dict | None = None,
+            nursery_fd: int | None = None,
+            stdin: StdioTarget = None,
+            stdout: StdioTarget = None,
+            stderr: StdioTarget = None,
+    ) -> asyncio.subprocess.Process:
+        self._check_running()
+        env = self.env.dump_moss_env(for_child_process=True)
+        if cell_address is not None:
+            env["MOSS_CELL_ADDRESS"] = cell_address
+        elif "MOSS_CELL_ADDRESS" in env:
+            env.pop("MOSS_CELL_ADDRESS")
+        if extra_env is not None:
+            env.update(extra_env)
+        return await self._nursery.spawn(
+            *args, cwd=str(cwd) if cwd is not None else None,
+            env=env, nursery_fd=nursery_fd,
+            stdin=stdin, stdout=stdout, stderr=stderr,
+        )
 
     def register_lifecycle_objects(self, obj: MatrixLifecycleObject) -> None:
         if self.is_running():
@@ -599,23 +657,9 @@ class MatrixImpl(Matrix):
                 wait_done.append(t)
             await asyncio.gather(*wait_done, return_exceptions=True)
 
-    async def _ensure_parent_process_exists(self) -> None:
-        if self.env.parent_pid == 0:
-            return
-        try:
-            parent = psutil.Process(int(self.env.parent_pid))
-        except (ValueError, TypeError, psutil.NoSuchProcess):
-            return
-
-        while not self._closing_event.is_set():
-            if not parent.is_running():
-                self.close()
-                break
-            await asyncio.sleep(2)
-
     @contextlib.asynccontextmanager
-    async def _ensure_parent_process_exists_ctx_manager(self):
-        task = asyncio.create_task(self._ensure_parent_process_exists())
+    async def _nursery_pipe_watchdog_ctx_manager(self):
+        task = asyncio.create_task(watch_nursery_pipe(lambda: self.close()))
         try:
             yield
         finally:
@@ -760,7 +804,12 @@ class MatrixImpl(Matrix):
                     await self._async_exit_stack.enter_async_context(bound)
 
             await self._async_exit_stack.enter_async_context(self._ensure_task_group_canceled_ctx_manager())
-            await self._async_exit_stack.enter_async_context(self._ensure_parent_process_exists_ctx_manager())
+            await self._async_exit_stack.enter_async_context(self._nursery_pipe_watchdog_ctx_manager())
+            await self._async_exit_stack.enter_async_context(self._nursery)
+
+            # ── cell meta — 启动完成，注册到文件系统 ──
+            self._env.write_cell_meta()
+
             self.logger.info("%s initialized with env: %s", self._log_prefix, self.env.dump_moss_env(
                 with_os_env=False,
             ))
@@ -786,6 +835,8 @@ class MatrixImpl(Matrix):
             # host 退出：删除 scope meta
             if self._is_main:
                 self._env.delete_scope_meta()
+            # 所有 cell 退出：删除 cell meta
+            self._env.delete_cell_meta()
 
             # exit all the stack
             await self._async_exit_stack.__aexit__(exc_type, exc_val, exc_tb)
