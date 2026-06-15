@@ -197,13 +197,26 @@ flowchart LR
 
 图出来了。我说执行命令。
 <mac:run timeout="15"><![CDATA[
-(function() {
-    'use strict';
-    var Terminal = Application('Terminal');
-    Terminal.activate();
-    Terminal.doScript('echo hello', { in: Terminal.windows[0] });
-    return { success: true, action: 'exec_in_terminal' };
-})();
+  (function() {
+      'use strict';
+      var Terminal = Application('Terminal');
+
+      // 确保终端在运行（没有则启动）
+      if (!Terminal.running()) {
+          Terminal.launch();
+      }
+      // 保证至少有一个窗口
+      if (Terminal.windows.length === 0) {
+          Terminal.Window().make();
+      }
+      // 给脚本桥接一点时间同步
+      delay(0.3);
+
+      Terminal.activate();
+      delay(0.2);
+      Terminal.doScript('echo hello', { in: Terminal.windows[0] });
+      return { success: true };
+  })();
 ]]></mac:run>
 
 每句话配一个动作。这就是 CTML 的流式系统调用。
@@ -211,13 +224,26 @@ flowchart LR
 4. 用 mac JXA 打开终端执行命令，演示"系统调用"。
 我说看一下现在几点。
 <mac:run timeout="15"><![CDATA[
-(function() {
-    'use strict';
-    var Terminal = Application('Terminal');
-    Terminal.activate();
-    Terminal.doScript('date', { in: Terminal.windows[0] });
-    return { success: true, action: 'exec_date' };
-})();
+  (function() {
+      'use strict';
+      var Terminal = Application('Terminal');
+
+      // 确保终端在运行（没有则启动）
+      if (!Terminal.running()) {
+          Terminal.launch();
+      }
+      // 保证至少有一个窗口
+      if (Terminal.windows.length === 0) {
+          Terminal.Window().make();
+      }
+      // 给脚本桥接一点时间同步
+      delay(0.3);
+
+      Terminal.activate();
+      delay(0.2);
+      Terminal.doScript('date', { in: Terminal.windows[0] });
+      return { success: true };
+  })();
 ]]></mac:run>
 
 5. 结果回来后自然念出时间，然后说。

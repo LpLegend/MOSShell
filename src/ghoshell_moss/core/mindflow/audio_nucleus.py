@@ -1,3 +1,5 @@
+import time
+
 from ghoshell_common.contracts import LoggerItf
 from ghoshell_container import IoCContainer
 
@@ -21,14 +23,18 @@ __all__ = [
 class AudioNucleus(BufferNucleus):
     """Audio signal nucleus — aggregate ASR signals into attention impulses.
 
-    SPEECH_STARTED (incomplete) signals are buffered but do NOT interrupt
-    the current attention — they accumulate until a SPEECH_FINAL arrives.
-    SPEECH_FINAL purges incomplete predecessors, produces a complete Impulse
-    with interrupt=True, and triggers the articulate→action loop.
+    SPEECH_STARTED (incomplete) signals preempt attention immediately on the
+    first packet — the incomplete Impulse carries interrupt=True, triggers
+    shell.stop_interpretation(), and occupies attention via complete=False.
+    Subsequent signals in the same session accumulate silently into the buffer.
 
-    Only complete (SPEECH_FINAL) impulses carry interrupt=True.  Incomplete
-    impulses (SPEECH_STARTED only, without a matching FINAL) do not interrupt
-    — they are buffered silently and expire via the pulse beat mechanism.
+    SPEECH_FINAL purges incomplete predecessors and produces a complete
+    Impulse (interrupt=False) that delivers the full speech content to the
+    already-occupied attention.  If no STARTED preceded it (standalone FINAL),
+    the complete impulse goes through normal arbitration without interrupt.
+
+    Reverse suppress (aligned with InterruptNucleus): pop_impulse starts a
+    victory-side cooldown; suppress only clears the buffer on the failure side.
     """
 
     async def _process_signal(self, signal: Signal) -> None:
@@ -41,9 +47,29 @@ class AudioNucleus(BufferNucleus):
 
     def _rebuild_impulse(self) -> Impulse | None:
         impulse = super()._rebuild_impulse()
-        if impulse is not None and impulse.complete:
+        if impulse is not None and not impulse.complete:
+            # 首包打断: incomplete impulse preempts attention, claims it
+            # via complete=False.  Complete (FINAL) delivers content to
+            # the occupied attention without re-interrupting.
             impulse.interrupt = True
         return impulse
+
+    def suppress(self, suppress_by: Impulse) -> None:
+        # 失败侧不进冷静期 — 只清理 buffer.
+        # 与 InterruptNucleus 对齐: impulse 仲裁失败只可能是 same-id absorb
+        # 或 stale, 这两种都不需要冷却. 覆写 BufferNucleus.suppress 避免
+        # 在失败侧设置 _suppress_until.
+        self._signals.clear()
+        self._impulse_cache = None
+
+    def pop_impulse(self, impulse: Impulse) -> None:
+        # 反向 suppress: 仲裁胜利后启动冷静期, 防止 shell churn.
+        # 语音打断成功后短时间内不再通知, 避免反复 stop_interpretation
+        # + 重建 attention 的抖动. 与 InterruptNucleus 对齐.
+        if not self.is_running():
+            return
+        self._suppress_until = time.monotonic() + self._suppress_seconds
+        self._event_loop.create_task(self._atomic_clear_buffer())
 
 
 class AudioNucleusMeta(NucleusMeta):
