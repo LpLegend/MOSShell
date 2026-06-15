@@ -759,9 +759,14 @@ class AbsAttention(Attention, ABC):
             # 做一个低阶的自省, 防止另外两个循环卡死.
             while not self._aborted_event.is_set():
                 if self.current_strength() <= self._system_floor_strength:
-                    # 自主结束.
-                    self.abort(asyncio.TimeoutError("attention fade out"))
-                    break
+                    # 如果 articulate 或 action 仍在运行，说明 attention 实际活跃，
+                    # 只是耗时较长（如 TTS 播放）。刷新强度计时器，避免误杀。
+                    if not self._articulate_stop_event.is_set() or not self._action_stop_event.is_set():
+                        self._strength_refreshed_at = time.monotonic()
+                    else:
+                        # 自主结束.
+                        self.abort(asyncio.TimeoutError("attention fade out"))
+                        break
                 try:
                     await asyncio.wait_for(self._aborted_event.wait(), 0.5)
                 except asyncio.TimeoutError:

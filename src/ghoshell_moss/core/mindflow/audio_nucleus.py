@@ -47,7 +47,7 @@ class AudioNucleus(BufferNucleus):
 
     def _rebuild_impulse(self) -> Impulse | None:
         impulse = super()._rebuild_impulse()
-        if impulse is not None and not impulse.complete:
+        if impulse is not None and impulse.complete:
             # 首包打断: incomplete impulse preempts attention, claims it
             # via complete=False.  Complete (FINAL) delivers content to
             # the occupied attention without re-interrupting.
