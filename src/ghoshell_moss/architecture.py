@@ -66,6 +66,7 @@ import ghoshell_moss.contracts as contracts
 # ============================================================================
 
 import ghoshell_moss.core.py_channel as channel_impl
+import ghoshell_moss.core.memento as memento_impl
 import ghoshell_moss.host as host_impl
 import ghoshell_moss.host.tui as tui_design
 import ghoshell_moss.host.tui_entries as tui_entries
@@ -89,5 +90,4 @@ import ghoshell_moss.topics as system_topics
 # ============================================================================
 
 import ghoshell_moss.channels as openbox_channels
-import ghoshell_moss.nuclei as openbox_nuclei
 import ghoshell_moss.core.concepts.tools as tools
