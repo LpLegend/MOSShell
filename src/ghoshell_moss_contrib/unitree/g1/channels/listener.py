@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import janus
 
@@ -79,7 +80,10 @@ _event_q: janus.Queue | None = None
 
 
 def _try_drain_and_enqueue() -> None:
-    """drain listener, 非空则入队. 可被多个 callback 源安全调用."""
+    """drain listener, 非空则入队. 可被多个 callback 源安全调用.
+
+    drain() 始终包含 partial 并 abort 当前 session — 无论 partial 是否存在.
+    """
     if _event_q is None:
         return
     batch = listener.drain()
@@ -152,6 +156,7 @@ def _on_fsm_button(button_name: str) -> None:
 
     A 键 (trigger): 无差别 drain → 非空入队 + 白闪确认.
     Y 键 (audio_toggle): 翻转自由对话模式 + LED 确认.
+    F1 键 (listener_toggle): 翻转 listener ASR 硬开关, 等价耳机中键.
     X 键 (interrupt): 不管, 由 fsm channel 处理.
     """
     logger.info("fsm button: %s", button_name)
@@ -161,6 +166,8 @@ def _on_fsm_button(button_name: str) -> None:
             led.play_event(led.blink("#ffffff", count=2, period_ms=200))
         elif button_name == "audio_toggle":
             _toggle_free_dialog()
+        elif button_name == "listener_toggle":
+            _on_headphone_btn()
     except Exception:
         logger.exception("_on_fsm_button(%s): 异常 (isolated)", button_name)
 
@@ -181,32 +188,38 @@ def _on_sentence(_utterance) -> None:
 _INSTRUCTION = """\
 你有近场听觉 — 通过蓝牙耳机接收佩戴者对你说话的声音.
 
-**当前状态: 默认关闭.** 你**现在听不到**耳机的声音. 佩戴者需要**按一下耳机上的按键**
-来开启聆听. 开启后你会听到 "聆听开启" 的语音确认, 此后佩戴者的每一句话你都能在
-context 里看到.
+**当前状态: 默认关闭.** 你**现在听不到**耳机的声音. 佩戴者有两个入口开启聆听:
+
+  - **按耳机上的中键** (最方便, 无授权前置)
+  - **按遥控器 F1 键** (需先按 L1+Start 进 AI 模式)
+
+两个入口等价, 开启后你会听到 "聆听开启" 的语音确认, 此后佩戴者的每一句话
+你都能在 context 里看到.
 
 **你不能自己开启聆听** — 交互权在佩戴者手里. 如果有人问你怎么通过耳机和你说话,
-或问你能不能听到 — 直接告诉他: "按一下耳机上的按键就可以, 我听到后会给你确认."
+或问你能不能听到 — 直接告诉他: "按一下耳机上的中键就可以, 或者按遥控器 F1
+(需要先按 L1+Start 进 AI 模式). 我听到后会给你确认."
 
 开启后:
 - 佩戴者说话 → 实时出现在你的 context (<g1.listener_utterance>)
 - 佩戴者可以长篇说话不会被打断. VAD 自动切句.
-- 佩戴者再次按耳机按键 → 关闭聆听 ("聆听关闭" 语音确认)
+- 再按耳机中键 / F1 键 → 关闭聆听 ("聆听关闭" 语音确认)
 
 你的近场听觉状态随时在 <g1.listener_status> 里. paused=true 就是关着的.
-告诉佩戴者按耳机按键就好.
 
-自由对话模式 (Y 键):
-- 佩戴者按遥控器 Y 键切换. 开启后, 每句 VAD 判停时自动通知你, 你会被唤醒.
+自由对话模式 (遥控器 Y 键, 需 AI 模式):
+- 佩戴者按 Y 键切换. 开启后, 每句 VAD 判停时自动通知你, 你会被唤醒.
+- 前置: 聆听必须已开 (F1 或耳机中键). 聆听关时自由对话开关无效.
 - <g1.listener_free_dialog> 反映当前是否开启.
 
-A 键:
+A 键 (需 AI 模式):
 - 无论自由对话是否开启, 按 A 键立即把当前累积内容通知你.
 
-**Y/A 键的前置**: 需要先按遥控器 L1+Start 进 AI 模式, Y/A 才生效. 未进 AI 模式时
-按 Y/A 只在 fsm history 留一条 "人按了但没生效" 事件 (你能通过 g1_fsm channel
-的 <g1.fsm_events> 看到), 不触发本 channel 效果. 如果佩戴者反映 "按了 Y/A
-没反应" — 直接告诉他: "按一下 L1+Start 进 AI 模式先, 然后再按 Y 或 A".
+**Y/A/F1 键的前置**: 需要先按遥控器 L1+Start 进 AI 模式, 才生效. 未进 AI 模式时
+按 Y/A/F1 只在 fsm history 留一条 "人按了但没生效" 事件 (你能通过 g1_fsm channel
+的 <g1.fsm_events> 看到), 不触发本 channel 效果. 如果佩戴者反映 "按了 Y/A/F1
+没反应" — 直接告诉他: "按一下 L1+Start 进 AI 模式先, 然后再按". 耳机中键不受
+此前置约束.
 
 远场听觉:
 - G1 机身自带麦克风阵列 (g1.asr channel). 走到 G1 身边说话会被自动识别进 context.
@@ -276,16 +289,24 @@ async def _on_startup() -> None:
 
 @listener_channel.build.running
 async def _running_loop() -> None:
-    """消费 janus queue, 在 channel context 内发送 NotifySignal."""
+    """消费 janus queue, 在 channel context 内发送 NotifySignal.
+
+    payload 格式: 每条一行 "[HH:MM:SS 类型] 文本". 类型: FINAL (VAD 判停) /
+    FORCED (A 键强制打断, partial 当 final). items 按到达时间升序 — 最早说的
+    在最上, 最新的在最下, 让模型顺序读.
+    """
     while True:
         batch = await _event_q.async_q.get()
         try:
-            lines: list[str] = []
+            lines: list[str] = ["=== 佩戴者近场语音 (蓝牙耳机 ASR) ==="]
             for u in batch.items:
+                ts = time.strftime("%H:%M:%S", time.localtime(u.received_at))
                 tag = "FORCED" if u.forced else "FINAL"
-                lines.append(f"[{tag}] {u.text}")
+                lines.append(f"[{ts} {tag}] {u.text}")
+            if batch.forgotten:
+                lines.append(f"(此前有 {batch.forgotten} 句被 buffer 挤掉未收到)")
             content = "\n".join(lines)
-            description = f"近场语音: {batch.items[0].text if batch.items else '(空)'}"
+            description = f"近场语音 ({len(batch.items)}句): {batch.items[-1].text if batch.items else '(空)'}"
             signal = new_notify_signal(
                 content,
                 priority=Priority.FATAL,
@@ -310,21 +331,30 @@ async def _listener_context() -> list[Message]:
     if h.status != "ok" or h.paused:
         return messages
 
-    recent = listener.peek_recent_finalized(_RECENT_N)
-    for u in recent:
-        messages.append(Message.new(
-            tag="g1.listener_utterance",
-            attributes={
-                "id": u.id,
-                "ts": f"{u.received_at:.1f}",
-            },
-        ).with_content(u.text))
-
+    # 未 drain 的历史 (finalized, 按到达时间升序)
     if h.forgotten_since_last_drain:
         messages.append(Message.new(
             tag="g1.listener",
             attributes={"forgotten": h.forgotten_since_last_drain},
         ).with_content(f"有 {h.forgotten_since_last_drain} 句话被遗忘了."))
+
+    recent = listener.peek_recent_finalized(_RECENT_N)
+    for u in recent:
+        ts = time.strftime("%H:%M:%S", time.localtime(u.received_at))
+        messages.append(Message.new(
+            tag="g1.listener_utterance",
+            attributes={"ts": ts},
+        ).with_content(u.text))
+
+    # 当前流式 partial — 独立一条, 与 finalized 历史语义不同:
+    # 人正在说、还没说完. drain 时会被一并带走并 abort session.
+    partial = listener.peek_partial()
+    if partial is not None:
+        ts = time.strftime("%H:%M:%S", time.localtime(partial.received_at))
+        messages.append(Message.new(
+            tag="g1.listener_utterance",
+            attributes={"ts": ts, "partial": "true"},
+        ).with_content(partial.text))
 
     return messages
 

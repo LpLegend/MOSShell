@@ -1,14 +1,13 @@
 ---
-title: Unitree G1 Integration
-status: in-progress
-priority: P0
 created: 2026-06-04
-updated: 2026-07-01
 depends: []
-milestone:
-description: >-
-  将 Unitree G1 人形机器人通过 unitree_sdk2_python 集成到 MOSS，作为 bodies app 提供 CTML 可调用的全身运动控制、手臂操作和音频交互能力。
-  安全优先的渐进式推进：文档摸底 → 脚本验证 → channel 设计 → 多级模式迭代。不做高阶开发。
+description: 将 Unitree G1 人形机器人通过 unitree_sdk2_python 集成到 MOSS，作为 bodies app 提供 CTML
+  可调用的全身运动控制、手臂操作和音频交互能力。 安全优先的渐进式推进：文档摸底 → 脚本验证 → channel 设计 → 多级模式迭代。不做高阶开发。
+milestone: null
+priority: P0
+status: completed
+title: Unitree G1 Integration
+updated: '2026-07-06'
 ---
 
 # Unitree G1 Integration
@@ -95,10 +94,10 @@ moss --ai codex blueprint mindflow           # Signal/Nucleus/Impulse/Articulato
 | B | 代码仓库摸底 | 完成 (2026-06-08) |
 | C | 硬件环境记录 | 完成 (2026-06-14) |
 | D | MOSS 装机 | 完成 (2026-06-14/15) |
-| E | 基线实验 (SDK 脚本) | **进行中** — P0 17/18/19 通过; P1 21 通过; P2 26/27 通过; 20/22 待实机 |
-| F | 安全理解 | **进行中** — 范式转为运动模式主场; 遥控器主权; 不进调试模式 |
-| G | Channel 设计 | **进行中** — 2026-07-02 六个 channel 全部落地并集成到 unitree_g1 mode; 5/6 端到端验证通过, listener 待修 |
-| H | 多级模式迭代 | 未开始 (依赖 showcase 基线通过, 预计 7-03) |
+| E | 基线实验 (SDK 脚本) | 完成 (2026-06-29/30) — P0 17/18/19; P1 21; P2 26/27 通过. 20/22/24 延期: 20 吊架风险暂缓, 22 待 SDK 修正, 24 不阻塞主线 |
+| F | 安全理解 | 完成 (2026-06-30) — 范式定型: 运动模式主场, 遥控器永久主权, 不进调试模式 |
+| G | Channel 设计与集成 | 完成 (2026-07-02/05) — 六个 channel 全部落地, listener drain 语义修正, 全部集成到 unitree_g1 mode |
+| H | 多级模式迭代 | **延期** — 待 MOSS beta1 收敛 (matrix cells 治理) + 整体架构规划后作为独立长期任务推进 |
 
 ## 能力路线图 (四轴)
 
@@ -179,6 +178,36 @@ L0 通道骨架: arms channel 起 + main.py 串起来 + show_current 命令
 完整 session 历史按时间倒序索引. 详细内容已迁移到 design/ 与 discuss/, FEATURE.md
 只保留入口与关键节点结论.
 
+### 2026-07-05/06 — listener drain 语义修正 + 第一集成阶段收口
+
+由 claude-sonnet-4-6 与人类工程师协作.
+
+**listener channel drain 语义三项修正**:
+
+1. `drain()` 去掉 `force_finalize_partial` 参数 — 始终 drain partial + abort session.
+   无论人说到一半还是刚说完, drain 都能把当前全部内容交出去.
+2. `drain()` 始终 abort 当前 session, 即使 partial 为 None — 消除"第二次按 A 拿到
+   上一轮内容"的 bug. 根因: 用户刚停止说话时 partial 已 None 但 is_final 仍在 pipeline,
+   不 abort 则 in-flight final 会在 drain 后写入 buffer, 下次 drain 才被消费.
+3. `context_messages` 加入 partial 独立一条 (partial="true" 属性); forgotten 告警
+   移到历史列表前方 (时序语义: 先告知有 gap 再给历史).
+
+**MODE.md CTML 作用域文档**: 补充 `until="flow"` (默认) vs `until="all"` 的语义说明
++ "数一二三同时前后走"具体对比例子 — 防止 LLM 因默认 flow 导致动作与语音时序脱节.
+
+**第一集成阶段闭环**: Phase A-G 完成. 遗留问题已知且不阻塞 — 作为后续迭代任务承接.
+
+**已知遗留问题 (不阻塞闭环, 后续迭代)**:
+
+- listener ASR drain 仍非最佳实践 (边说边触发的自由对话模式时序待细化)
+- action 队列可能阻塞 (locomotion 命令未加超时保护, 长时间占用 channel 未处理)
+- 耳机按键 evdev dispatch 未闭环 (OpenRun Pro AVRCP 中键 code 修正后未实机确认)
+- arms channel 为空骨架, L0-L1 未实装 (待 weight=0 释放行为实机验证后推进)
+- script 20/22/24 未跑 (sit/stand 物理行为, arm action state, FSM 完整可达图)
+
+**后续计划**: Phase H (多级模式迭代) 延期. 待 MOSS beta1 收敛 (核心: matrix cells 治理)
++ 整体架构规划完成后, 作为独立长期任务持续推进.
+
 ### 2026-07-02 — 全 channel 落地 + 集成验证 (listener 除外)
 
 由 claude-opus-4-7 与人类工程师协作. 一下午集中实装 L4 channel 层 + 集成到 unitree_g1 mode, 端到端实机验证 5/6 通过. showcase 基线明天可闭环.
@@ -208,6 +237,17 @@ L0 通道骨架: arms channel 起 + main.py 串起来 + show_current 命令
 - `_INSTRUCTION` docstring: 明文 Y/A 键要求 AI 模式 (L1+Start), 引导模型教人类.
 
 **7-02 早晨三个 5 分钟脚本** (arm weight=0 释放 / Jetson 摄像头 / ExecuteAction 99 复位) 因下午集中集成 channels 未跑, 顺延到 7-03 开机后. 不阻塞 showcase 基线.
+
+**7-02 晚间 — 耳机按键实机定位 + 改遥控器 F1** (由 claude-sonnet-4-6 与人类工程师协作):
+
+- **HFP profile 全流程通** (含蓝牙连接稳定脚本 `openrun_ready.sh` — 蓝牙连 → HFP profile → verify source 一次到位). `_listener_sen_setup` voiced 占比 48.4% 确认物理链路 OK. 8kHz CVSD codec 未升 mSBC, PulseAudio 层客户端接入时自动上采样到 16kHz 送火山引擎, 识别效果实测可用. `_listener_sen_dialog` 端到端 partial + FINAL 全通.
+- **耳机按键 code 假设错**: `runtime/headphone_buttons.py:_PLAYCD_CODE = 200` 是从别的耳机移植的注释, `_headphone_buttons_probe` 实测 OpenRun Pro AVRCP 中键**交替发 `KEY_PLAYCD (200)` / `KEY_PAUSECD (201)`** — 耳机根据自己认为的"当前播放态"决定 code. 修为 `_TRIGGER_CODES = frozenset({200, 201})`, 两个 code 都触发 dispatch. 但 `_headphone_sen_toggle` 实机验证仍无 `[TOGGLE]` 打印 — 未继续折腾根因 (推测 evdev 事件流可能有 blocking / 时序问题, 或 AVRCP 通道在无播放上下文时按键被 BlueZ 拦截).
+- **改方案 — 遥控器 F1 = listener ASR toggle 主入口**. F1/F3 已在 `sdk/_buttons.py:VALID_BUTTONS` 定义, 遥控器物理键映射已就绪. 选 F1 而非 L1+Y: 遥控器 L1 组合键已占满 (start/select/方向 5 键); F 键是独立按键, F1 归 listener toggle, F3 留给未来. F1 走 AI 模式 gate (跟 X/A/Y 一致), 耳机按键路径保留作**无 AI 模式前置的替代入口** — 两条路径正交, 耳机是"无授权直接开麦", F1 是"授权状态下模型可见的开麦". 落地:
+  - `story_202607_fsm.py`: 加 `BTN_LISTENER_TOGGLE = frozenset({"f1"})`, 挂进 `_AI_MODE_BUTTONS` + `_DOWNSTREAM_BUTTONS`, 语义名 `listener_toggle`.
+  - `channels/listener.py: _on_fsm_button`: 加 `elif button_name == "listener_toggle": _on_headphone_btn()` — 复用现有 pause/resume + LED + TTS + status 分路反馈逻辑.
+  - `_INSTRUCTION`: 明文 F1/耳机中键**两个等价入口**, F1 需 AI 模式前置.
+  - Y 键保留原自由对话切换语义 — ASR 硬开关 (F1/耳机) 与自由对话通知策略 (Y) 语义正交, 两个开关独立: ASR = 数据源, 自由对话 = 通知策略, 依赖关系是"自由对话依赖 ASR 开".
+- **给后续实例的坑**: 耳机按键实机在 evdev 层看到设备但 dispatch 不触发的问题未闭环 — 如果后续要复用蓝牙耳机按键 (e.g. 换耳机型号), 需要重跑 probe + 在 `_headphone_sen_toggle` 里加 raw evdev 事件日志, 定位 evdev event 是否真的进了 `_dispatch()`. 现在 code 已修但没实机确认, 是一颗 dormant bug.
 
 **给后续实例的复盘**:
 
@@ -528,4 +568,3 @@ index.md 里明确写了 `mode_machine` 是 Dof 配置字节 (不是 FSM),
   - Mindflow 能力评估 → partial-triggered 抢占已在 mindflow + listener app 实装, 不需要新建 Articulator
 - **已推翻 / 重估**:
   - arms channel 拓扑 (6-30 `design/2026-06-30_g1_arms_animation.md` §3/§5) → **7-01 讨论后推翻 §3 命令面 + §5 学习闭环**. Track 派 + Animation JSON 让 LLM 写 keyframe 违反 §0.3 上位范式纪律 (Logos 层调度命名 VLA, 不接触内部实现). 上位范式 §0 仍成立. 设计文件已加"已被 7-01 修正"标注, 保留原内容作为设计演进档案. 本期 arms 形态改按 "能力金字塔" 节推进, 不写完整修正设计文档 (等 L2/L3 实践积累后一次收口)
-
